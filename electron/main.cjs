@@ -3,6 +3,9 @@ const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
+const { suggestIgnoreGlobs, ENV_KEYS, DEFAULT_MODEL, DEFAULT_BASE_URL } = require("./ai.cjs");
+const { loadEnvFiles } = require("./env.cjs");
+const { collectRelevantSourcePaths } = require("./sources.cjs");
 
 const isDev = Boolean(process.env.REA_DEV_SERVER_URL);
 
@@ -15,6 +18,28 @@ const DEFAULT_SETTINGS = {
   // Fallback executable when scriptPath is empty (e.g. a global `rea` install).
   binPath: "rea",
   workdir: process.cwd(),
+  // Optional TEMP/TMP override for the child process. REA's Windows native
+  // self-test creates a protected-DACL probe in the process temp dir, so
+  // pointing it at a known-good writable local NTFS directory avoids the
+  // "private object requires a present protected DACL" access-denied failure.
+  tempDir: "",
+  // Glob patterns for nodes to hide in the viewer (one per line / comma separated).
+  // REA itself has no exclude option, so filtering happens at display time.
+  ignoreGlobs: ["**/node_modules", "**/.git", "**/.electron-cache"].join("\n"),
+  // When on, the pipeline passes --source-path for every file that survives the
+  // ignore rules, so REA skips reading/parsing the ignored ones (REA has no
+  // exclude flag of its own).
+  limitSources: true,
+  // Runtime observation is endpoint/target scoped, not directory scoped.
+  // One endpoint is remembered per channel so switching never loses it.
+  runtimeChannel: "inspector",
+  endpointInspector: "http://127.0.0.1:9229",
+  endpointElectron: "http://127.0.0.1:9222",
+  endpointBrowser: "http://127.0.0.1:9223",
+  fridaMode: "attach",
+  fridaTarget: "",
+  fridaScript: "",
+  observationMs: 2000,
   lastArgs: "providers",
 };
 
@@ -68,6 +93,25 @@ function resolveCommand(argsString, settings) {
 
 const running = new Map();
 
+/** .env files already loaded, shown in the UI so the key source is obvious. */
+let envSources = [];
+
+/**
+ * Load DEEPSEEK_* from .env files. Real environment variables always win,
+ * so a shell export overrides the file. Candidates are checked in order.
+ */
+function bootstrapEnv() {
+  try {
+    envSources = loadEnvFiles([
+      path.join(app.getAppPath(), ".env"),
+      path.join(process.cwd(), ".env"),
+      path.join(app.getPath("userData"), ".env"),
+    ]);
+  } catch (error) {
+    console.error("Failed to load .env files:", error);
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -101,11 +145,16 @@ ipcMain.handle("rea:run", (event, payload) => {
   const effective = { ...loadSettings(), ...(settings ?? {}) };
   const { exe, args } = resolveCommand(argsString, effective);
   const cwd = effective.workdir && effective.workdir.trim() ? effective.workdir : os.homedir();
+  const env = { ...process.env };
+  if (effective.tempDir && effective.tempDir.trim()) {
+    env.TEMP = effective.tempDir;
+    env.TMP = effective.tempDir;
+  }
 
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(exe, args, { cwd, env: process.env, windowsHide: true });
+      child = spawn(exe, args, { cwd, env, windowsHide: true });
     } catch (error) {
       resolve({ code: null, stdout: "", stderr: String(error), error: String(error), exe, args, cwd });
       return;
@@ -166,6 +215,45 @@ ipcMain.handle("rea:pick-file", async () => {
 
 ipcMain.handle("rea:read-file", (_event, filePath) => readJsonFile(filePath));
 
+ipcMain.handle("rea:collect-source-paths", async (_event, payload) => {
+  try {
+    const result = await collectRelevantSourcePaths(String(payload?.dir ?? ""));
+    return { ok: true, ...result };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("ai:pick-directory", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "选择要分析的目录",
+    properties: ["openDirectory"],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle("ai:suggest-ignores", async (_event, payload) => {
+  try {
+    const result = await suggestIgnoreGlobs({ dir: payload?.dir });
+    return { ok: true, ...result };
+  } catch (error) {
+    // Surface a readable message; never leak the API key.
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("ai:status", () => {
+  const keyName = ENV_KEYS.find((name) => (process.env[name] ?? "").trim());
+  return {
+    hasKey: Boolean(keyName),
+    keyName: keyName ?? null,
+    model: process.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
+    baseUrl: process.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
+    sources: envSources,
+  };
+});
+
 function readJsonFile(filePath) {
   try {
     const content = fs.readFileSync(filePath, "utf8");
@@ -176,6 +264,7 @@ function readJsonFile(filePath) {
 }
 
 app.whenReady().then(() => {
+  bootstrapEnv();
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

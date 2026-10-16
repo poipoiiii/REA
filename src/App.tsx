@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { GraphView, type LayoutName } from "./components/GraphView";
 import { SourcePanel } from "./components/SourcePanel";
 import { DetailPanel } from "./components/DetailPanel";
+import { RuntimeView } from "./components/RuntimeView";
+import { DEFAULT_IGNORE_GLOBS, filterGraph, parseGlobs } from "./lib/filter";
+import type { RuntimeReport } from "./lib/runtime";
 import type { NormGraph } from "./lib/types";
 
-type View = "app" | "call";
+type View = "app" | "call" | "runtime";
 
 export default function App() {
   const [settings, setSettings] = useState<ReaSettings | null>(null);
@@ -13,6 +16,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [layout, setLayout] = useState<LayoutName>("cose");
   const [view, setView] = useState<View>("app");
+  const [runtime, setRuntime] = useState<RuntimeReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -26,6 +30,7 @@ export default function App() {
 
   const handleData = useCallback((next: NormGraph, _raw: string, from: string) => {
     setGraph(next);
+    setRuntime(null);
     setSource(from);
     setSelectedId(null);
     setView(next.view);
@@ -33,7 +38,24 @@ export default function App() {
     setError(null);
   }, []);
 
+  const handleRuntime = useCallback((report: RuntimeReport, _raw: string, from: string) => {
+    setRuntime(report);
+    setGraph(null);
+    setSource(from);
+    setSelectedId(null);
+    setView("runtime");
+    setError(null);
+  }, []);
+
   const handleSelect = useCallback((id: string | null) => setSelectedId(id), []);
+
+  // Hide dependency/build noise (node_modules, .git, ...) at display time.
+  const globs = useMemo(
+    () => parseGlobs(settings?.ignoreGlobs ?? DEFAULT_IGNORE_GLOBS),
+    [settings?.ignoreGlobs],
+  );
+  const filtered = useMemo(() => (graph ? filterGraph(graph, globs) : null), [graph, globs]);
+  const visible = filtered?.graph ?? null;
 
   return (
     <div className="app">
@@ -56,6 +78,12 @@ export default function App() {
           >
             调用图 / 调用路径
           </button>
+          <button
+            className={view === "runtime" ? "tab active" : "tab"}
+            onClick={() => setView("runtime")}
+          >
+            运行时
+          </button>
         </div>
       </header>
 
@@ -77,26 +105,54 @@ export default function App() {
             settings={settings}
             onSettingsChange={handleSettingsChange}
             onData={handleData}
+            onRuntime={handleRuntime}
             onError={(message) => setError(message)}
           />
         </aside>
 
         <main className="col-center">
-          {graph && graph.nodes.length > 0 ? (
-            <>
-              {view !== graph.view && (
-                <div className="banner info">
-                  当前数据是「{graph.formatLabel}」，与所选视图不同；可按需切换视图以匹配。
-                </div>
-              )}
-              <GraphView
-                graph={graph}
-                layout={layout}
-                onLayoutChange={setLayout}
-                selectedId={selectedId}
-                onSelect={handleSelect}
-              />
-            </>
+          {view === "runtime" ? (
+            runtime ? (
+              <RuntimeView report={runtime} />
+            ) : (
+              <div className="empty">
+                <h3>暂无运行时数据</h3>
+                <p className="muted">
+                  在左侧「手动 → 运行命令」里跑 runtime 相关命令（会自动加 `--format json`）：
+                </p>
+                <ul className="muted">
+                  <li>`instrument-with-frida attach &lt;PID&gt; --script-file probe.js`</li>
+                  <li>`list-javascript-runtime-targets http://127.0.0.1:9229`</li>
+                  <li>`observe-javascript-runtime &lt;endpoint&gt; &lt;targetId&gt;`</li>
+                  <li>`list-electron-targets` / `inspect-electron-page`</li>
+                  <li>`list-browser-targets` / `inspect-web-page`</li>
+                </ul>
+              </div>
+            )
+          ) : graph && graph.nodes.length > 0 ? (
+            visible && visible.nodes.length > 0 ? (
+              <>
+                {view !== visible.view && (
+                  <div className="banner info">
+                    当前数据是「{visible.formatLabel}」，与所选视图不同；可按需切换视图以匹配。
+                  </div>
+                )}
+                <GraphView
+                  graph={visible}
+                  layout={layout}
+                  onLayoutChange={setLayout}
+                  selectedId={selectedId}
+                  onSelect={handleSelect}
+                />
+              </>
+            ) : (
+              <div className="empty">
+                <h3>全部节点都被忽略规则过滤了</h3>
+                <p className="muted">
+                  原始 {graph.nodes.length} 个节点全部匹配了忽略规则。请到左侧「高级」调整忽略规则。
+                </p>
+              </div>
+            )
           ) : (
             <div className="empty">
               <h3>暂无图数据</h3>
@@ -112,7 +168,14 @@ export default function App() {
         </main>
 
         <aside className="col-right">
-          <DetailPanel graph={graph} selectedId={selectedId} source={source} />
+          <DetailPanel
+            graph={view === "runtime" ? null : visible}
+            runtime={runtime}
+            selectedId={selectedId}
+            source={source}
+            removedNodes={filtered?.removedNodes ?? 0}
+            removedEdges={filtered?.removedEdges ?? 0}
+          />
         </aside>
       </div>
     </div>

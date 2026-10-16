@@ -3,3 +3,7 @@ dist/
 .electron-cache/
 .verify/
 .tmp/
+.env
+.env.*
+*.log
+npm-debug.log*

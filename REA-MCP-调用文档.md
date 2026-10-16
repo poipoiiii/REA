@@ -540,9 +540,79 @@ record_unknown(question="校验常量的来源与生成规则", severity="high",
 
 | 变量 | 用途 |
 | --- | --- |
+| `GHIDRA_INSTALL_DIR` | Ghidra 安装根目录（**必须是绝对路径**，本机为 `D:\Ghidra_\ghidra_12.1.4_PUBLIC`）。未设置时 REA 退化为在 `PATH` 里找 `ghidra.bat` / `ghidraRun.bat` / `ghidra.exe` / `ghidraRun.exe` 自动发现 |
+| `JAVA_HOME` | Ghidra provider 用它的 `bin\java.exe` 做 JDK 校验（区分 jdk/jre，不接受相对路径）。Ghidra 12.1.4 要求 **JDK 21+** |
 | `REA_JEB_MCP_URL` | 指向已启动的 JEB MCP 客户端 |
 | `REA_GHIDRA_STARTUP_TIMEOUT_MS` | Ghidra provider 启动超时（大二进制） |
 | `REA_HOPPER_STARTUP_TIMEOUT_MS` | Hopper provider 启动超时（大二进制） |
+
+可选调优项：`REA_GHIDRA_LANGUAGE_ID` / `REA_GHIDRA_COMPILER_SPEC_ID`（指定语言，后者必须与前者同用）、`REA_GHIDRA_SEED_FILE`（种子文件，绝对路径）、`REA_GHIDRA_DISABLED_ANALYZERS`、`REA_GHIDRA_NATIVEAOT_JAR`。
+
+### 8.1 本机 Ghidra（原生分析 provider）
+
+| 项目 | 值 |
+| --- | --- |
+| 安装根目录 | `D:\Ghidra_\ghidra_12.1.4_PUBLIC` |
+| 版本 | `12.1.4`（取自 `Ghidra\application.properties` 的 `application.version`）——**正是 REA 6.5.0 已验证的构建**（`SUPPORTED_GHIDRA_VERSION = 12.1.4`） |
+| headless 入口 | `D:\Ghidra_\ghidra_12.1.4_PUBLIC\support\analyzeHeadless.bat` |
+| 原生反编译器 | `Ghidra\Features\Decompiler\os\win_x86_64\decompile.exe` |
+| Java 要求 | `application.java.min=21`、`application.java.max=`（空 = 无上限）→ **需要 64 位完整 JDK 21+** |
+| 本机 JDK | `D:\jdk-21`（Temurin **JDK 21.0.12.1+1 LTS**，便携解压，含 `javac.exe`；原有的 JDK 17 未改动） |
+| 环境变量 | 用户级，`setx` 写入：`JAVA_HOME=D:\jdk-21`、`GHIDRA_INSTALL_DIR=D:\Ghidra_\ghidra_12.1.4_PUBLIC` |
+| 当前状态 | ✅ `available`（8/8 检查通过，`java_version=21.0.12.1`） |
+
+**定位顺序**：`GHIDRA_INSTALL_DIR`（显式设置优先级最高，即使路径失效也不会回退自动发现）→ 否则在 `PATH` 中查找 `ghidra.bat` / `ghidraRun.bat` / `ghidra.exe` / `ghidraRun.exe`，且要求同级存在 `Ghidra\application.properties` 与 `support\analyzeHeadless.bat`。本机该目录**不在 PATH**，所以必须显式设置 `GHIDRA_INSTALL_DIR`。
+
+本机已用**用户级**环境变量配置完成：
+
+```powershell
+setx JAVA_HOME "D:\jdk-21"
+setx GHIDRA_INSTALL_DIR "D:\Ghidra_\ghidra_12.1.4_PUBLIC"
+```
+
+若不想动全局环境变量，也可只用 MCP 注册的 `env` 字段覆盖（只对 REA 子进程生效）：
+
+```json
+"env": {
+  "GHIDRA_INSTALL_DIR": "D:\\Ghidra_\\ghidra_12.1.4_PUBLIC",
+  "JAVA_HOME": "D:\\jdk-21"
+}
+```
+
+验证：
+
+```powershell
+rea providers --format json     # 看 analysis_provider_candidates 里 id=ghidra 的 availability
+```
+
+**实测（2026-10-16，REA 6.5.0）**：`id=ghidra` → `status: available`，8 项检查全部通过：
+
+```
+configuration / platform=win32 / architecture=x64 / installation / version=12.1.4
+/ headless / native_decompiler（decompile.exe 报告 pe x86_64）/ java（21.0.12.1）
+install_dir = D:/Ghidra_/ghidra_12.1.4_PUBLIC
+```
+
+踩坑记录：配置前 `JAVA_HOME` 指向 Temurin **JDK 17.0.17**，当时 Ghidra 前 7 项全过、**只有 `java` 失败**——
+
+```
+code:   unsupported_version
+reason: Update JAVA_HOME to the root of a 64-bit full JDK 21 or newer installation.
+```
+
+换成 `D:\jdk-21` 即通过，**Ghidra 安装路径本身不需要改动，卡点只在 JDK 版本**。校验要求 **64 位完整 JDK**（JRE 不行，会区分 jdk/jre；也不接受相对路径）。
+
+**生效时机**：`setx` 写入 `HKCU\Environment`，**只对之后新启动的进程生效**；已开着的 IDE / 终端不会自动继承（实测同一台机器上旧终端里 `$env:JAVA_HOME` 仍是 JDK 17），需**重启 Trae / 新开终端**。另外 `setx` 会保留写入时的正斜杠形式（`D:/jdk-21`、`D:/Ghidra_/ghidra_12.1.4_PUBLIC`），实测 REA 能正常解析。
+
+**Windows Ghidra P0 的能力边界**（取自 `rea providers` 的 capabilities）：
+
+- 接受原生 **x86 / x86-64 PE 应用与 DLL**，以及显式选择的 raw 6502 镜像。
+- **不支持**：托管（.NET）目标、敌意/敏感目标、可变路径（mutable-path）目标。
+- 依赖：匹配的 Windows x64 原生 addon、本地 NTFS 目标与运行时、Windows 10+；原生句柄会做路径准入、私有 DACL 与 Job Object 归属。
+- 会话内元数据写操作 `set_address_name` / `set_addresses_names` 在 Windows 上**不可用**（`availability_code: unsupported_host`，"Windows Ghidra P0 does not admit database mutation"）；其余读操作（assembly / pseudo_code / xrefs / search_* / read_bytes 等）均 `available: true`。
+- Windows 桥接走认证的 IPv4 回环（Node 的 path-based IPC 不暴露 Java AF_UNIX socket），端点文件内不含 bearer token。
+
+同一份 `providers` 输出里的另两个原生 provider：Hopper `unsupported_host`（Windows 不支持），IDA `not_configured`（需 `REA_IDA_MCP_CONFIG`）。
 
 **重要的使用边界**
 
@@ -560,6 +630,9 @@ record_unknown(question="校验常量的来源与生成规则", severity="high",
 | 启动即退出并提示 "compiled runtime is missing" | 该安装的 `dist` 不完整，重装 `rea-agents` |
 | Windows 路径问题 | `command` / `args` 用双反斜杠转义；`path` 参数用绝对路径 |
 | 原生命令报无 provider | `rea providers` 查看已配置 provider，安装 Hopper/Ghidra/IDA 或指定 `provider_id` |
+| `rea providers` 里 Ghidra 报 `unsupported_version` | `JAVA_HOME` 落到了低于 Ghidra 声明下限的 JDK（12.1.4 要 JDK 21+）。本机已用 `setx JAVA_HOME "D:\jdk-21"` 修好；复现时先确认**当前进程**拿到的 `JAVA_HOME` 是新值（详见 8.1） |
+| 改了 `JAVA_HOME` / `GHIDRA_INSTALL_DIR` 但状态没变 | `setx` 只对之后新启动的进程生效；重启 Trae（MCP 子进程随之重启）或在新终端里用 `rea providers` 复核 |
+| Ghidra 检测不到（candidates 里没有 ghidra） | 显式设 `GHIDRA_INSTALL_DIR` 为安装根目录的绝对路径；仅当它在 `PATH` 中时才可省略 |
 | 大目标请求超时 | 用 `detail=summary`，或调大 `REA_GHIDRA_STARTUP_TIMEOUT_MS` / `REA_HOPPER_STARTUP_TIMEOUT_MS`，JS 分析可调 `analysis_timeout_ms` / `max_heap_mb` |
 | `update_unknown` 报 stale | 重新 `list_unknowns` 取最新 `expected_revision` 再写 |
 | 结果被截断 | 用 `--filter-output` / `--token-limit` / `--token-offset`（CLI），或 `inspect_analysis_view` 分页（MCP） |

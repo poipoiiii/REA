@@ -1,10 +1,14 @@
 import { useMemo } from "react";
+import type { RuntimeReport } from "../lib/runtime";
 import type { NormGraph } from "../lib/types";
 
 type Props = {
   graph: NormGraph | null;
+  runtime?: RuntimeReport | null;
   selectedId: string | null;
   source: string | null;
+  removedNodes?: number;
+  removedEdges?: number;
 };
 
 function renderValue(value: unknown): string {
@@ -19,7 +23,14 @@ function renderValue(value: unknown): string {
   return String(value);
 }
 
-export function DetailPanel({ graph, selectedId, source }: Props) {
+export function DetailPanel({
+  graph,
+  runtime = null,
+  selectedId,
+  source,
+  removedNodes = 0,
+  removedEdges = 0,
+}: Props) {
   const selected = useMemo(
     () => graph?.nodes.find((node) => node.id === selectedId) ?? null,
     [graph, selectedId],
@@ -35,6 +46,40 @@ export function DetailPanel({ graph, selectedId, source }: Props) {
   }, [selected]);
 
   if (!graph) {
+    if (runtime) {
+      return (
+        <div className="panel-section">
+          <h2 className="section-title">数据概览</h2>
+          <div className="kv">
+            <span>类型</span>
+            <b>运行时证据</b>
+          </div>
+          <div className="kv">
+            <span>操作</span>
+            <b className="ellipsis" title={runtime.operation}>
+              {runtime.operation || "—"}
+            </b>
+          </div>
+          {source && (
+            <div className="kv">
+              <span>来源</span>
+              <b className="ellipsis" title={source}>
+                {source}
+              </b>
+            </div>
+          )}
+          {runtime.facts.map((fact) => (
+            <div className="kv" key={fact.label}>
+              <span>{fact.label}</span>
+              <b className="ellipsis" title={fact.value}>
+                {fact.value}
+              </b>
+            </div>
+          ))}
+          <p className="hint">明细（脚本 / 消息 / DOM / 控制台 / 网络）与限制说明见中间区域。</p>
+        </div>
+      );
+    }
     return (
       <div className="panel-section">
         <p className="hint">还没有数据。请在左侧运行命令、加载文件或粘贴 JSON。</p>
@@ -63,6 +108,14 @@ export function DetailPanel({ graph, selectedId, source }: Props) {
           {graph.nodes.length} / {graph.edges.length}
         </b>
       </div>
+      {removedNodes > 0 && (
+        <div className="kv">
+          <span>已按忽略规则过滤</span>
+          <b>
+            {removedNodes} 节点 / {removedEdges} 边
+          </b>
+        </div>
+      )}
       {graph.coverage && (
         <div className="kv">
           <span>覆盖度</span>
