@@ -688,6 +688,30 @@ textarea::placeholder {
 }
 
 /* ---- 分段控件 / 目标列表 ---- */
+.pane {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pane[hidden] {
+  display: none;
+}
+
+.link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
 .seg {
   display: flex;
   gap: 4px;

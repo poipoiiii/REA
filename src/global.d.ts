@@ -27,6 +27,11 @@ declare global {
     fridaTarget: string;
     fridaScript: string;
     observationMs: number;
+    nativeExe: string;
+    nativeSnapshot: string;
+    ghidraDir: string;
+    javaHome: string;
+    disabledAnalyzers: string;
     lastArgs: string;
   }
 
@@ -82,6 +87,34 @@ declare global {
       pickFile(): Promise<ReaFileResult | null>;
       readFile(filePath: string): Promise<ReaFileResult>;
       collectSourcePaths(payload: { dir: string }): Promise<ReaSourcePaths>;
+      pickExecutable(): Promise<string | null>;
+      pathInfo(filePath: string): Promise<{ exists: boolean; size: number | null; isFile: boolean }>;
+      mcp: {
+        status(): Promise<unknown>;
+        open(filePath: string): Promise<{
+          path: string;
+          format: string;
+          kind: string;
+          sha256: string;
+          architecture: string;
+        }>;
+        procedures(): Promise<{
+          items: { address: string; value: string; procedure?: { external?: boolean; thunk?: boolean } }[];
+          limitations: string[];
+        }>;
+        searchProcedures(pattern: string): Promise<{
+          items: { address: string; value: string; procedure?: { external?: boolean; thunk?: boolean } }[];
+        }>;
+        callGraph(address: string, direction: "forward" | "backward"): Promise<unknown>;
+        resolveContaining(address: string): Promise<{
+          query_address?: string;
+          found: boolean;
+          procedure: unknown;
+          reason?: string;
+        }>;
+        closeBinary(): Promise<{ ok: boolean }>;
+        shutdown(): Promise<{ ok: boolean }>;
+      };
       aiPickDirectory(): Promise<string | null>;
       aiSuggestIgnores(payload: { dir: string }): Promise<ReaAiSuggestion>;
       aiStatus(): Promise<ReaAiStatus>;

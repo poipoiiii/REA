@@ -3,6 +3,7 @@ import { normalize, parseJsonLoose } from "../lib/normalize";
 import { makeIgnoreMatcher, parseGlobs } from "../lib/filter";
 import { detectRuntime, type RuntimeReport } from "../lib/runtime";
 import { RuntimePanel } from "./RuntimePanel";
+import { NativePanel } from "./NativePanel";
 import type { NormGraph } from "../lib/types";
 
 type Props = {
@@ -11,6 +12,8 @@ type Props = {
   onData: (graph: NormGraph, rawText: string, source: string) => void;
   onRuntime: (report: RuntimeReport, rawText: string, source: string) => void;
   onError: (message: string) => void;
+  /** Lets the graph click handler reach the native panel's lazy expander. */
+  registerExpand?: (fn: ((address: string) => Promise<void>) | null) => void;
 };
 
 type Mode = "run" | "file" | "paste";
@@ -105,7 +108,14 @@ function Skeleton({ lines }: { lines: number }) {
   );
 }
 
-export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onError }: Props) {
+export function SourcePanel({
+  settings,
+  onSettingsChange,
+  onData,
+  onRuntime,
+  onError,
+  registerExpand,
+}: Props) {
   const [mode, setMode] = useState<Mode>("run");
   const [args, setArgs] = useState("");
   const [paste, setPaste] = useState("");
@@ -119,7 +129,7 @@ export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onE
   const [rules, setRules] = useState<Rules | null>(null);
   const [limitedSources, setLimitedSources] = useState(0);
   const [rerunBusy, setRerunBusy] = useState(false);
-  const [pane, setPane] = useState<"dir" | "runtime">("dir");
+  const [pane, setPane] = useState<"dir" | "native" | "runtime">("dir");
 
   const workdir = settings?.workdir ?? "";
 
@@ -368,6 +378,12 @@ export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onE
           目录（静态分析）
         </button>
         <button
+          className={pane === "native" ? "seg-item active" : "seg-item"}
+          onClick={() => setPane("native")}
+        >
+          原生 exe
+        </button>
+        <button
           className={pane === "runtime" ? "seg-item active" : "seg-item"}
           onClick={() => setPane("runtime")}
         >
@@ -375,7 +391,21 @@ export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onE
         </button>
       </div>
 
-      {pane === "runtime" ? (
+      <div className="pane" hidden={pane !== "native"}>
+        <NativePanel
+          settings={settings}
+          onSettingsChange={onSettingsChange}
+          run={executeRea}
+          running={running}
+          status={status}
+          onCancel={() => void handleCancel()}
+          onError={onError}
+          onGraph={onData}
+          registerExpand={registerExpand}
+        />
+      </div>
+
+      <div className="pane" hidden={pane !== "runtime"}>
         <RuntimePanel
           settings={settings}
           onSettingsChange={onSettingsChange}
@@ -385,8 +415,9 @@ export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onE
           onCancel={() => void handleCancel()}
           onError={onError}
         />
-      ) : (
-        <>
+      </div>
+
+      <div className="pane" hidden={pane !== "dir"}>
       <label className="field">
         <span>工作目录</span>
         <div className="input-row">
@@ -622,8 +653,7 @@ export function SourcePanel({ settings, onSettingsChange, onData, onRuntime, onE
           )}
         </div>
       </details>
-        </>
-      )}
+      </div>
     </div>
   );
 }

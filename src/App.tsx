@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GraphView, type LayoutName } from "./components/GraphView";
 import { SourcePanel } from "./components/SourcePanel";
 import { DetailPanel } from "./components/DetailPanel";
@@ -18,6 +18,10 @@ export default function App() {
   const [view, setView] = useState<View>("app");
   const [runtime, setRuntime] = useState<RuntimeReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const nativeExpandRef = useRef<((address: string) => Promise<void>) | null>(null);
+  const registerExpand = useCallback((fn: ((address: string) => Promise<void>) | null) => {
+    nativeExpandRef.current = fn;
+  }, []);
 
   useEffect(() => {
     window.rea.getSettings().then(setSettings).catch(() => undefined);
@@ -47,7 +51,11 @@ export default function App() {
     setError(null);
   }, []);
 
-  const handleSelect = useCallback((id: string | null) => setSelectedId(id), []);
+  const handleSelect = useCallback((id: string | null) => {
+    setSelectedId(id);
+    // Native call graph: clicking a function address lazily fetches its dossier.
+    if (id) void nativeExpandRef.current?.(id);
+  }, []);
 
   // Hide dependency/build noise (node_modules, .git, ...) at display time.
   const globs = useMemo(
@@ -107,6 +115,7 @@ export default function App() {
             onData={handleData}
             onRuntime={handleRuntime}
             onError={(message) => setError(message)}
+            registerExpand={registerExpand}
           />
         </aside>
 

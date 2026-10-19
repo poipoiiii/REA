@@ -6,9 +6,43 @@ const { spawn } = require("node:child_process");
 const { suggestIgnoreGlobs, ENV_KEYS, DEFAULT_MODEL, DEFAULT_BASE_URL } = require("./ai.cjs");
 const { loadEnvFiles } = require("./env.cjs");
 const { collectRelevantSourcePaths } = require("./sources.cjs");
+const { McpClient, LONG_TIMEOUT_MS } = require("./mcp.cjs");
+
+const mcp = new McpClient();
+
+/** Env for every REA child process: TEMP override plus optional provider paths. */
+function buildReaEnv(settings) {
+  const env = { ...process.env };
+  if (settings.tempDir && settings.tempDir.trim()) {
+    env.TEMP = settings.tempDir;
+    env.TMP = settings.tempDir;
+  }
+  if (settings.ghidraDir && settings.ghidraDir.trim()) env.GHIDRA_INSTALL_DIR = settings.ghidraDir.trim();
+  if (settings.javaHome && settings.javaHome.trim()) env.JAVA_HOME = settings.javaHome.trim();
+  if (settings.disabledAnalyzers && settings.disabledAnalyzers.trim()) {
+    env.REA_GHIDRA_DISABLED_ANALYZERS = settings.disabledAnalyzers.trim();
+  }
+  return env;
+}
+
+/** `rea --mcp` is the stdio server; one long-lived process keeps the binary bound. */
+function resolveMcpCommand(settings) {
+  if (settings.scriptPath) {
+    const node = settings.nodePath && settings.nodePath.trim() ? settings.nodePath : process.execPath;
+    return { exe: node, args: [settings.scriptPath, "--mcp"] };
+  }
+  return { exe: settings.binPath && settings.binPath.trim() ? settings.binPath : "rea", args: ["--mcp"] };
+}
+
+async function ensureMcp() {
+  const settings = loadSettings();
+  const { exe, args } = resolveMcpCommand(settings);
+  const cwd = settings.workdir && settings.workdir.trim() ? settings.workdir : os.homedir();
+  await mcp.start({ exe, args, cwd, env: buildReaEnv(settings) });
+  return mcp;
+}
 
 const isDev = Boolean(process.env.REA_DEV_SERVER_URL);
-
 /** Known-good defaults for this machine's REA installation (overridable in the UI). */
 const DEFAULT_SETTINGS = {
   // When scriptPath is set the CLI runs as: <nodePath> <scriptPath> <args>
@@ -40,6 +74,13 @@ const DEFAULT_SETTINGS = {
   fridaTarget: "",
   fridaScript: "",
   observationMs: 2000,
+  // Native (exe) analysis: the target plus a reusable Ghidra analysis snapshot.
+  nativeExe: "",
+  nativeSnapshot: "",
+  // Optional provider env (AGENTS.md #6: setx does not affect a running process).
+  ghidraDir: "",
+  javaHome: "",
+  disabledAnalyzers: "",
   lastArgs: "providers",
 };
 
@@ -138,18 +179,24 @@ function createWindow() {
 
 ipcMain.handle("rea:get-settings", () => loadSettings());
 
-ipcMain.handle("rea:save-settings", (_event, next) => saveSettings(next));
+ipcMain.handle("rea:save-settings", (_event, next) => {
+  const before = loadSettings();
+  const merged = saveSettings(next);
+  // Provider env is baked into the MCP child process at spawn time, so a
+  // changed setting must recycle the server or it keeps the old environment.
+  const envKeys = ["tempDir", "ghidraDir", "javaHome", "disabledAnalyzers", "nodePath", "scriptPath", "binPath"];
+  if (envKeys.some((key) => String(before[key] ?? "") !== String(merged[key] ?? "")) && mcp.running) {
+    void mcp.close();
+  }
+  return merged;
+});
 
 ipcMain.handle("rea:run", (event, payload) => {
   const { runId, argsString, settings } = payload ?? {};
   const effective = { ...loadSettings(), ...(settings ?? {}) };
   const { exe, args } = resolveCommand(argsString, effective);
   const cwd = effective.workdir && effective.workdir.trim() ? effective.workdir : os.homedir();
-  const env = { ...process.env };
-  if (effective.tempDir && effective.tempDir.trim()) {
-    env.TEMP = effective.tempDir;
-    env.TMP = effective.tempDir;
-  }
+  const env = buildReaEnv(effective);
 
   return new Promise((resolve) => {
     let child;
@@ -224,6 +271,93 @@ ipcMain.handle("rea:collect-source-paths", async (_event, payload) => {
   }
 });
 
+ipcMain.handle("rea:pick-executable", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "选择要分析的可执行文件",
+    properties: ["openFile"],
+    filters: [
+      { name: "可执行 / 库", extensions: ["exe", "dll", "node", "so", "dylib", "sys", "bin"] },
+      { name: "All Files", extensions: ["*"] },
+    ],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle("rea:path-info", async (_event, filePath) => {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return { exists: true, size: stat.size, isFile: stat.isFile() };
+  } catch {
+    return { exists: false, size: null, isFile: false };
+  }
+});
+
+ipcMain.handle("mcp:status", async () => {
+  const client = await ensureMcp();
+  const body = await client.callTool("binary_session", {});
+  return { ...client.diagnostics, session: body?.result ?? body };
+});
+
+ipcMain.handle("mcp:open", async (_event, filePath) => {
+  const client = await ensureMcp();
+  const body = await client.callTool("open_binary", { path: filePath, provider_id: "ghidra" }, LONG_TIMEOUT_MS);
+  return body?.result ?? body;
+});
+
+ipcMain.handle("mcp:procedures", async () => {
+  const client = await ensureMcp();
+  const body = await client.callTool("list_procedures", {}, LONG_TIMEOUT_MS);
+  return {
+    items: Array.isArray(body?.normalized_result) ? body.normalized_result : [],
+    limitations: body?.limitations ?? [],
+  };
+});
+
+ipcMain.handle("mcp:search-procedures", async (_event, payload) => {
+  const client = await ensureMcp();
+  const pattern = String(payload?.pattern ?? "").trim();
+  if (!pattern) throw new Error("pattern is required");
+  const body = await client.callTool(
+    "search_procedures",
+    { pattern, mode: payload?.mode ?? "literal", case_sensitive: false },
+    LONG_TIMEOUT_MS,
+  );
+  return { items: Array.isArray(body?.normalized_result) ? body.normalized_result : [] };
+});
+
+ipcMain.handle("mcp:call-graph", async (_event, payload) => {
+  const client = await ensureMcp();
+  const { address, direction } = payload ?? {};
+  return client.callTool(
+    "get_call_graph",
+    { address, direction: direction ?? "forward" },
+    LONG_TIMEOUT_MS,
+  );
+});
+
+ipcMain.handle("mcp:resolve", async (_event, address) => {
+  const client = await ensureMcp();
+  const body = await client.callTool("resolve_containing_procedure", { address });
+  return body?.normalized_result ?? body;
+});
+
+ipcMain.handle("mcp:close-binary", async () => {
+  if (mcp.running) {
+    try {
+      await mcp.callTool("close_binary", {});
+    } catch {
+      // Closing a already-closed session is harmless.
+    }
+  }
+  return { ok: true };
+});
+
+ipcMain.handle("mcp:shutdown", async () => {
+  await mcp.close();
+  return { ok: true };
+});
+
 ipcMain.handle("ai:pick-directory", async () => {
   const result = await dialog.showOpenDialog({
     title: "选择要分析的目录",
@@ -279,5 +413,11 @@ app.on("window-all-closed", () => {
       /* ignore */
     }
   }
+  // The MCP server holds a live provider session; always tear it down.
+  void mcp.close();
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  void mcp.close();
 });

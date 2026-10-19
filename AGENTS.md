@@ -192,6 +192,67 @@ npm start            # 用 dist/ 启动 Electron（需先 build）
 - **验证**：`rea list-frida-devices --format json` 应返回 `local` / `socket` / `barebone`。
 - **注意**：脚本用 `send({...})` 输出，REA 会把它录成 `normalized_result.messages`；`send` 之外的东西不会进证据。
 
+### #14 原生 exe：CLI 没有「整程序调用图」，只有 per-function dossier
+
+- **结论**："选一个 exe → 直接得到调用图"做不到。`analyze <exe>` 只给概览（`document/image_base/segments/procedure_count/string_count`，**没有 nodes/edges**）。
+- **原因**：调用图相关工具**全是 MCP-only** —— `get_call_graph`、`trace_call_path`、`build_call_path`、`list_procedures`、`procedure_callers`、`procedure_callees`、`compare_functions`、`find_xrefs_to_name`、`batch_decompile` 都在 `dist/cliCommandNames.js` 的 `MCP_TOOLS_WITHOUT_DEDICATED_CLI` 里，**没有对应 CLI 命令**。Viewer 驱动的是 CLI，故拿不到现成调用图。
+- **CLI 实际能拿到（实测 REA 6.5.0 + Ghidra 12.1.4）**：
+  - `search <exe> <pattern> --kind procedures` → 名字+地址；`normalized_result` 是**数组** `[{address,value},…]`，**不是对象**（按 `.address[0]` 取会拿到怪东西）
+  - `function <exe> <addr>` → 完整 dossier：`callers` / `callees` / `incoming_references` / `outgoing_references` / `unresolved_calls` / `assembly` / `pseudocode` / `basic_blocks` / `native_api` / `native_value_flow`
+  - `xrefs <exe> <addr>` → **纯地址字符串数组**（如 `["0x33595b12c"]`），**没有**引用类型、也没有所属函数
+  - `trace <exe> <query>` → **查交叉引用的首选**：`{query, matches[]（type=string|procedure）, references[]}`，每条引用带 `containing_procedure.procedure`；不在函数内时给 `found:false` + `reason:"not_in_procedure"`（数据段/IAT 指针常见）
+  - `function` **只接受函数入口地址**：传调用点地址（如 `0x33595b12c`）会直接 `Analysis failed`（实测），所以别指望用它把 xref 地址反查成函数
+  - 另有 `decompile` / `instructions` / `resolve-native-call-targets`
+- **`--snapshot` 不会避免重新分析（实测 2026-10-16）**：873KB PE 上首次 `analyze` **33.1s**、复用快照再 `analyze` **32.1s**、`function` **32.3s / 32.1s**、`trace` **32.6s** —— **每条命令都是 ~32s**。快照落成 471KB JSON，只保存 REA 的 `binding/analysis_profile` 与观测，**不是 Ghidra 分析数据库**；REA 自己的 limitation 也写明 "the next provider query imports the original artifact again"。仍建议传（省掉部分重复工作），但**不要指望它把命令变成秒级**。
+- **原生查询要快，只能走 MCP 常驻会话**：MCP 有 `open_binary` / `close_binary` / `binary_session`（见 `REA-MCP-调用文档.md` 6.1），开一次后后续工具调用复用同一会话；且 `resolve_containing_procedure`（xref 地址 → 所属函数）、`get_call_graph`、`trace_call_path` 也只有 MCP 有。
+- **前置**：进程要能看到 `GHIDRA_INSTALL_DIR` + `JAVA_HOME`(21+)，见 #6。
+- **要做「exe → 调用图」两条路**：
+  1. Viewer 用 `search` 枚举函数 + 逐个取 `callers/callees`，**自己拼** nodes/edges 喂现有调用图视图（复用 snapshot）。
+  2. Viewer 改成 **MCP client** 直接调 `get_call_graph` / `build_call_path`（工作量大：要在 Electron 里实现 MCP stdio）。
+
+---
+
+### #15 MCP 原生调用图：`get_call_graph` 的真实结构（含方向陷阱）
+
+- **`open_binary`**：必填 `path`（**绝对路径**）；可选 `provider_id`、`snapshot_path`。返回 `{path, format, kind, sha256, architecture}`。会话保持到 `close_binary` / 显式切换。
+- **`binary_session`**：`{open:true, capabilities:[...]}`，**不触发分析**；Windows P0 下 `annotate_native_function` = `unsupported_host`（不允许改数据库）。
+- **`get_call_graph`**：`normalized_result.graph` 是**按层级组织的对象**，不是扁平数组：
+  ```json
+  { "graph": { "0": [节点...], "1": [节点...], "2": [...] } }
+  ```
+  节点 = `{address, status:"ok"|"error", calls:[address...], relationship_coverage:{status,diagnostics,limitations,limited_directions}, limitations:[...]}`
+- **边是隐式的**：由节点的 `calls` 表达，没有独立 edges 数组。
+- **⚠ `calls` 是方向相对的**：`forward` 时 `calls` = 被调（边 `node -> call`）；**`backward` 时 `calls` = 调用方（边 `call -> node`，建边必须反向）**。实测：`0x335929244` 在 forward 下 `calls: []`，在 backward 下 `calls: ["0x335911e60", ...]`（它的调用方）。
+- **节点只有地址、没有名字**：要显示函数名需另取 `list_procedures` 或 `resolve_containing_procedure`。
+- 外部目标是 `EXTERNAL:0xNN`；`relationship_coverage.status` 可能为 `partial`（附 `limited_directions`）。
+- 顶层 `limitations` 可能极长（每个 no-return 调用一条），UI 要折叠/截断。
+- **`resolve_containing_procedure` 对数据段地址返回 `found:false, reason:"not_in_procedure"` 是正确答案**，不是失败（IAT 指针本就没有所属函数）。
+- **实测性能（873KB PE，MCP 会话）**：`initialize` 936ms；`open_binary` **60ms**（不预分析）；`list_procedures` **35.7s**（**首次查询才真正分析**）；之后 `get_call_graph` **17ms / 5ms**、`resolve_containing_procedure` **4ms**。对比 CLI 每条 ~32s，约 **2000×**。
+- **Viewer 已接入**：`electron/mcp.cjs`（stdio 客户端，一行一个 JSON-RPC；`rea --mcp` 启动）；IPC `mcp:*`；`src/lib/mcpGraph.ts` 负责扁平化层级 + **backward 反向建边**。交叉引用仍走 CLI `trace`（它能直接给 `containing_procedure`）。
+- **任何 `get_call_graph` 之前必须先 `open_binary`**：MCP 不会自动绑定目标；CLI 的 `trace` 不需要绑定，所以会出现「xref 有结果、点引用点却拿不到图」的割裂。Viewer 已做**懒绑定**（点节点/引用点时若未连接则自动 `open_binary`）。
+- **`list_procedures` 的条目比 CLI 丰富**：`{address, value, procedure:{external, thunk, thunk_target}}`，可直接用于标签与 external 判定。
+
+### #16 MCP stdio 响应预算：大目标上 `list_procedures` 会直接失败
+
+- **现象**：`list_procedures` 报 `The operation completed, but its complete MCP response exceeds the stdio response budget. The analysis result was not truncated.`（实测 19.8MB 的 Go 二进制 `frpc.exe`）。
+- **原因**：REA **不截断**超大 MCP 响应，超过 stdio 预算就直接报错。`list_procedures` / `search_procedures` **都没有分页或 limit 参数**。
+- **处置**：大目标不要全量枚举，改用 **`search_procedures { pattern, mode:"literal" }`** 按名字取子集（Go 二进制可用 `main`）。本项目 Viewer 已实现：捕获该错误后自动切到「按名字搜索函数」，并把步骤标成"函数过多，请用搜索加载子集"。
+- **同理**：`get_call_graph` 也可能超预算（可达图太大）→ 换更具体的起点，或改用 `backward`。
+
+### #17 Ghidra 全量分析无法跳过；`REA_GHIDRA_DISABLED_ANALYZERS` 只能缩短
+
+- **结论**：**没有任何办法脱离全量扫描**。Ghidra provider 有硬门槛：*"The session serves operations only after Ghidra reports default auto-analysis complete; incomplete analysis does not expose partial results."* —— 分析未完成前 `open_binary` 之后的任何查询都不返回部分结果。
+- **证伪过的"捷径"**：
+  - `--snapshot` / MCP `snapshot_path` 不减时间（见 #14），它存的是 REA 自己的观测，不是 Ghidra 工程。
+  - IDA 适配器明确只收可执行文件、**不接受 analysis database**，且本机 `not_configured`；Hopper 在 Windows `unsupported_host`。
+- **可行优化**：`REA_GHIDRA_DISABLED_ANALYZERS` 环境变量（逗号分隔的分析器名）。格式校验：名字须匹配 `^[A-Za-z0-9][A-Za-z0-9 ._-]*$`，最多 32 个、每个 ≤120 字符；空值等于不覆盖。
+  - **实测（873KB PE，REA 6.5.0 + Ghidra 12.1.4）**：
+    - 默认全部分析器：分析 **35.7s**，端点总计 36.8s，函数 **1449**
+    - `Decompiler Parameter ID,Decompiler Switch Analysis`：分析 **28.1s**，总计 29.4s，函数 **1449（不变）**，调用图不受影响
+    - → **−21%**。其余分析器禁用后可能影响反编译质量/类型恢复，别盲关。
+  - Viewer 已接入：「原生 exe → Provider 环境 → REA_GHIDRA_DISABLED_ANALYZERS」，写入设置项 `disabledAnalyzers`，由 `buildReaEnv` 注入子进程；**改动需重新连接目标才生效**。
+- **真正的省时来自会话复用**：MCP 会话只付一次分析成本（见 #15），之后毫秒级；CLI 每命令都重付 ~32s。
+
 ---
 
 ## 二、维护约定
